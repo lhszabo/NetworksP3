@@ -1,0 +1,33 @@
+{
+    "hostname": "localhost",
+    "port": 18741,
+    "peers": 5,
+    "content_info": ["Firefox_Final_VO.ogv", "trailer_400p.ogg"],
+    "peer_info": [
+        {
+            "hostname": "localhost",
+            "port": 18742,
+            "content_info": ["Carnegie_Mellon_University.jpg"]
+        },
+        {
+            "hostname": "localhost",
+            "port": 18743,
+            "content_info": []
+        },
+        {
+            "hostname": "localhost",
+            "port": 18744,
+            "content_info": []
+        },
+        {
+            "hostname": "localhost",
+            "port": 18745,
+            "content_info": []
+        },
+        {
+            "hostname": "localhost",
+            "port": 18746,
+            "content_info": []
+        }
+    ]
+}
