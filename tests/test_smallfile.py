@@ -4,7 +4,9 @@ from kill_command import kill_command
 
 TIMEOUT = 5
 
-FILENAME = 'Carnegie_Mellon_University.jpg'
+FILENAME = "Carnegie_Mellon_University.jpg"
+# FILENAME = "hello.txt"
+
 
 print()
 print("=" * 100)
@@ -52,6 +54,7 @@ kill_command()
 
 return_bool = False
 check_exists_bool = os.path.exists(execution_dir_1+FILENAME)
+# print("file exist in node 1", check_exists_bool)
 if check_exists_bool:
 	return_bool = filecmp.cmp(execution_dir_1+FILENAME, execution_dir_2+FILENAME, shallow=False)
 
@@ -61,7 +64,9 @@ else:
 	print("===> Test Case [[[Fail]]]")
 
 if check_exists_bool:
-	print("remove file -", execution_dir_1+FILENAME)
-	os.remove(execution_dir_1+FILENAME)
+  print("not removing file")
+  pass
+	# print("remove file -", execution_dir_1+FILENAME)
+	# os.remove(execution_dir_1+FILENAME)
 
 print("=" * 100)

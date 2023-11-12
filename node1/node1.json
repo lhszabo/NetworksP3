@@ -7,7 +7,7 @@
         {
             "hostname": "localhost",
             "port": 18742,
-            "content_info": ["Carnegie_Mellon_University.jpg"]
+            "content_info": ["Carnegie_Mellon_University.jpg", "hello.txt"]
         },
         {
             "hostname": "localhost",
