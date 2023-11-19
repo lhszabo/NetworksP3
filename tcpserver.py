@@ -2,34 +2,38 @@ import socket, sys
 import threading
 import json
 import enum
+import os
+import time
+from pathlib import Path
 
 # from https://docs.skyswitch.com/en/articles/579-what-does-udp-timeout-mean#:~:text=UDP%20Timeout%20refers%20to%20the,at%2030%20or%2060%20seconds.
 TIMEOUT = 30
+BUFSIZE_FROM_FILE = 1400
+BUFSIZE_TO_REC = 1500 # including PUT header
+W_SIZE = 30
 filename = None
 fetch_file = False
-BUFSIZE = 1400
-send_ack = False
-keep_transmitting = False
+# send_ack = False
 fin = False
+sent_chunk = None
+rec_chunk = None
 
 class Network_node():
-  # host = -1
-  # port = -1
-  # peers = -1
-  # content = -1
-  # owner = -1
-  def __init__(self, host, port, peers, content):
+  def __init__(self, host, port, peers, content, name):
+    # eventually each node-node interaction stored in a dictionary
     self.host = host
     self.port = port
-    self.peers = peers # dictionary of network_peer's where key is port
+    self.peers = peers # dictionary of network_peer's where key is port as string
     self.content = content # list of content infos
     self.owner = (None, None)
-    
-  def set_node_owner(self, owner):
-    self.owner = owner
-  
-  def get_node_owner(self):
-    return self.owner
+    self.requestor = (None, None)
+    self.name = name # for debugging purposes only 
+    self.state_machine = State_machine()
+    self.filename = None
+    self.pkt_length = 0
+    self.length_received = 0
+    self.rec_acks = dict()
+    # node.last_file_ptr = 0
     
 class Network_peer():
   def __init__(self, host, content):
@@ -39,68 +43,47 @@ class Network_peer():
     
 class Handshake_states(enum.Enum):
   closed = 1
-  listen = 2
-  syn_rec = 3
-  syn_sent = 4
-  est = 5
-  fin_wait_1 = 6
-  closing = 7
-  fin_wait_2 = 8
-  time_wait = 9
-  close_wait = 10
-  last_ack = 11
-  chk_rec = 12
-  ack_rec = 13
+  syn_rec = 2
+  syn_ack_rec = 3
+  send = 4
+  req = 5
+  done = 6
+  wait_req = 7
+  wait_send = 8
 
-# ONLY IMPLEMENTED FOR STOP AND WAIT SO FAR -> may not need dotted lines transitions
+# ONLY IMPLEMENTED FOR STOP AND WAIT SO FAR, transitions only, handling outputs manually
 class State_machine():
   def __init__(self):
     self.state = Handshake_states.closed
   
-  def next(self, input):
-    # advancing to next state and return necessary output to other node
-    if (self.state == Handshake_states.closed and input == "LISTEN"):
-      self.state = Handshake_states.listen
-      return None
-    if (self.state == Handshake_states.closed and input == "CONNECT"):
-      self.state = Handshake_states.syn_sent
-      return "SYN"
-    
-    elif (self.state == Handshake_states.listen and input == "SYN"):
+  def next(self, input): # (cur state, input) -> next state  
+    if (self.state == Handshake_states.closed and input == "SYN"):
       self.state = Handshake_states.syn_rec
-      return "SYN+ACK"
-    elif (self.state == Handshake_states.listen and input == "CLOSE"):
-      self.state = Handshake_states.closed
-      return None
-    elif (self.state == Handshake_states.listen and input == "SEND"):
-      self.state = Handshake_states.syn_sent
-      return "SYN"
     
-    elif (self.state == Handshake_states.syn_rec and input == "RST"):
-      self.state = Handshake_states.listen
-      return None
-    elif (self.state == Handshake_states.syn_rec and input == "ACK 0"):
-      self.state = Handshake_states.est
-      return None
+    elif (self.state == Handshake_states.syn_rec and input == "SYN+ACK"):
+      self.state = Handshake_states.syn_ack_rec
     
-    elif (self.state == Handshake_states.syn_sent and input == "CLOSE"):
-      self.state = Handshake_states.closed
-      return None
-    elif (self.state == Handshake_states.syn_sent and input == "SYN"):
-      self.state = Handshake_states.syn_rec
-      return "SYN+ACK"
-    elif (self.state == Handshake_states.syn_sent and input == "SYN+ACK"):
-      self.state = Handshake_states.est
-      return "ACK"
-  
+    elif (self.state == Handshake_states.syn_ack_rec and input == "rec ACK 0"):
+      self.state = Handshake_states.send
+    
+    elif (self.state == Handshake_states.syn_ack_rec and input == "send ACK 0"):
+      self.state = Handshake_states.req
+    
+    elif (self.state == Handshake_states.send and input == "SENT PKT"):
+      self.state = Handshake_states.wait_send
+    elif (self.state == Handshake_states.wait_send and input == "REC PKT ACK"):
+      self.state = Handshake_states.send
+      
+    elif (self.state == Handshake_states.req and input == "REC PKT"):
+      self.state = Handshake_states.wait_req
+    elif (self.state == Handshake_states.wait_req and input == "SENT PKT ACK"):
+      self.state = Handshake_states.req
+    
   def reset(self):
-    self.state = Handshake_states.closed
-    
-requestor_machine = State_machine()
-owner_machine = State_machine()
-owner_machine.next("LISTEN")
+    self.state = Handshake_states.done
 
 def parse_conf(conf_file):
+  name = conf_file.split(".")[0] # for debugging purposes only
   f = open(conf_file, 'r')
   json_dict = json.load(f)
   host = json_dict['hostname']
@@ -113,7 +96,7 @@ def parse_conf(conf_file):
     peer_content = peer['content_info']
     new_peer = Network_peer(peer_host, peer_content)
     peer_dict[port_key] = new_peer
-  node = Network_node(host, port, peer_dict, content)
+  node = Network_node(host, port, peer_dict, content, name)
   return node
 
 def is_file(cmd):
@@ -129,7 +112,8 @@ def get_file_owner(node, filename):
     if (filename in peer_content):
       file_peer_port = peer_port
       owner_host = peer.host
-  return owner_host, int(file_peer_port)
+  node.owner = (owner_host, int(file_peer_port))
+  node.filename = filename
 
 def parse_syn(msg):
   msg_fields = msg.split(" ")
@@ -138,95 +122,187 @@ def parse_syn(msg):
   sender_port = int(msg_fields[3])
   return filename, sender_host, sender_port
 
+def parse_rec_msg(rec_msg):
+  seq_num = None
+  chunk = None
+  for i in range(len(rec_msg)):
+    if (rec_msg[i] == 32): # 32 is the value for space
+      seq_num = rec_msg[:i].decode() # gives a str
+      chunk = rec_msg[i+1:]
+      return int(seq_num), chunk
+    
+
 def tx_thread(name, socket, node):
   while True:
-    f = None
-    
     global fetch_file
-    global send_ack
-    global fin
-    global send_ack
-    global keep_transmitting
-    
-    owner_host, file_peer_port = None, None
-    if (filename != None):
-      # print('in here')
-      owner_host, file_peer_port= get_file_owner(node, filename)
-      # print(owner_host, file_peer_port)
-    
+    global filename
+    global sent_chunk
+      
     if (fetch_file): # send SYN
-      # owner_host, file_peer_port = get_file_owner(node, filename)
-      msg = requestor_machine.next("CONNECT") # requestor machine in syn_sent
-      msg += " " + filename + " " + node.host + " " + str(node.port)
-      socket.sendto(msg.encode(), (owner_host, file_peer_port))
-      fetch_file = False # turn off
+      get_file_owner(node, filename) # setting node.owner and node.filename variable
+      node.requestor = (node.host, node.port)
+      node.state_machine.next("SYN")
+      msg = "SYN "
+      msg += filename + " " + node.host + " " + str(node.port)
+      socket.sendto(msg.encode(), node.owner)
+      # print(msg, node.name)
+      fetch_file = False
+      
+    elif (node.state_machine.state == Handshake_states.syn_rec):
+      msg = "SYN+ACK "
+      if (os.path.exists(node.filename)): # should only run for owner
+        file_size = Path(node.filename).stat().st_size # getting size in bytes
+        msg += str(file_size)
+        node.pkt_length = file_size
+        node.state_machine.next("SYN+ACK")
+        # print(msg, node.name)
+        socket.sendto(msg.encode(), node.requestor) 
     
-    elif (owner_machine.state == Handshake_states.syn_rec):
-      msg = "SYN+ACK"
-      # owner_host, file_peer_port = get_file_owner(node, filename)
-      print(owner_host, file_peer_port)
-      socket.sendto(msg.encode(), (owner_host, file_peer_port)) 
+    elif (node.state_machine.state == Handshake_states.syn_ack_rec):
+      if not (os.path.exists(node.filename)):
+        msg = "ACK 0"
+        node.state_machine.next("send ACK 0")
+        # print(msg, node.name)
+        # print(node.name, 'state is', node.state_machine.state)
+        socket.sendto(msg.encode(), node.owner) 
     
-    elif (requestor_machine.state == Handshake_states.est):
-      msg = "ACK 0"
-      # owner_host, file_peer_port = get_file_owner(node, filename)
-      socket.sendto(msg.encode(), (owner_host, file_peer_port)) 
-    
-    elif (owner_machine.state == Handshake_states.est):
-      # start transmitting data 
-      f = open(filename, "rb")
-      chunk = f.read(BUFSIZE)
-      if (chunk):
-        msg = "PUT " + chunk
-        socket.sendto(msg.encode(), (owner_host, file_peer_port))
-    
-    elif (send_ack):
-      ack_num = node.peers[str(file_peer_port)].ack
+    elif (node.state_machine.state == Handshake_states.send):
+      with open(node.filename, "rb") as file_descriptor:
+        # while True:
+          # req_port = node.requestor[1]
+          # cur_ack = node.peers[str(req_port)].ack
+          # for i in range(cur_ack):
+          #   file_descriptor.seek(BUFSIZE_FROM_FILE)
+          # chunk = file_descriptor.read(BUFSIZE_FROM_FILE)
+          # print(file_descriptor.tell())
+
+          # if (chunk and node.state_machine.state == Handshake_states.send):
+          if (node.length_received < node.pkt_length):
+            # node.length_received += len(chunk)
+            put_bytes = "PUT ".encode()
+            req_port = node.requestor[1]
+            cur_ack = node.peers[str(req_port)].ack
+              
+            # for i in range(cur_ack-1):
+              # print('i', i)
+            file_descriptor.seek(BUFSIZE_FROM_FILE*(cur_ack-1),1) # whence=1, ref from cur position
+              # print('tell', file_descriptor.tell())
+            chunk = file_descriptor.read(BUFSIZE_FROM_FILE)
+            sent_chunk = chunk
+            node.length_received += len(chunk)
+            # print('send', node.name, cur_ack)
+            ack_bytes = (str(cur_ack) + " ").encode()
+            node.peers[str(req_port)].ack += 1
+            msg = put_bytes + ack_bytes + chunk
+            socket.sendto(msg, node.requestor)
+            node.state_machine.next("SENT PKT")
+            # print('state should be wait send', node.state_machine.state, node.name)
+          # elif (not chunk and node.state_machine.state == Handshake_states.send):
+          else:
+            # print('getting here', node.length_received)
+            
+            # if (node.length_received == node.pkt_length):
+            msg = "FIN"
+            node.state_machine.reset()
+            socket.sendto(msg.encode(), node.requestor)
+          # file_descriptor.seek(BUFSIZE_FROM_FILE
+          file_descriptor.close()      
+    elif (node.state_machine.state == Handshake_states.wait_req):
+      # print('req sending ack', node.name)
+      owner_port = node.owner[1]
+      ack_num = node.rec_acks[owner_port]
       msg = "ACK " + str(ack_num)
-      socket.sendto(msg.encode(), (owner_host, file_peer_port))
-      node.peers[str(file_peer_port)].ack += 1
-      send_ack = False
-    
-    elif (keep_transmitting):
-      chunk = f.read(BUFSIZE)
-      if (chunk):
-        msg = "PUT " + chunk
-        socket.sendto(msg.encode(), (owner_host, file_peer_port))
-      else:
-        fin = True
-        keep_transmitting = False
-        msg = "FIN"
-        socket.sendto(msg.encode(), (owner_host, file_peer_port))
+      # msg = msg.to_bytes(byteorder="big")
+      socket.sendto(msg.encode(), node.owner)
+      node.state_machine.next("SENT PKT ACK")
+      # print('state should be req', node.state_machine.state, node.name, msg)
+      # node.peers[str(owner_port)].ack += 1
+      # send_ack = False
 
 def rx_thread(name, socket, node):
   while True:
-    rec_msg, addr = socket.recvfrom(BUFSIZE)
-    rec_msg = rec_msg.decode()
+    rec_msg, addr = socket.recvfrom(BUFSIZE_TO_REC)
+
+    global filename
+    global fin
     
-    if ("SYN " in rec_msg):
-      owner_machine.next("SYN")
+    put_bytes = "PUT ".encode()
+    # print(rec_msg.decode())
     
-    elif (rec_msg == "SYN+ACK"):
-      requestor_machine.next(rec_msg)
-    
-    elif (rec_msg == "ACK 0"):
-      owner_machine.next(rec_msg)
-    
-    elif ("PUT" in rec_msg):
-      with open(filename, "ab") as binary_file: # see appending issue
-        file_bytes = rec_msg.split(" ")[1]
-        binary_file.write(file_bytes)
-        global send_ack
-        send_ack = True
+    if (put_bytes == rec_msg[0:4] and node.state_machine.state == Handshake_states.req):
+      # print("HELLO")
+      seq_num, chunk = parse_rec_msg(rec_msg[4:])
+      # print('rec', node.name, 'sn', seq_num)
+      # assert(1==0)
+      prev_len = node.length_received
+      node.length_received += len(chunk)
+      # if not (node.length_received == node.pkt_length):
+        # assert(node.length_received == BUFSIZE_FROM_FILE*seq_num)
+      # rec_packets += 1
+      # print("rec_packets", rec_packets)
+      # print("REC LEN", len(chunk))
+      # if (node.length_received <= prev_len):
+        # print(node.length_received)
+        # print('len didnt change')
+      owner_port = node.owner[1]
+      prev_num = None
+      if (owner_port in node.rec_acks):
+        prev_num = node.rec_acks[owner_port]
+      node.rec_acks[owner_port] = seq_num
+      # if (prev_num != None):
+        # print('sn', seq_num)
+        # print('pn', prev_num)
+        # assert(seq_num == prev_num + 1)
         
-    elif ("ACK " in rec_msg and rec_msg[-1] != 0):
-      global keep_transmitting
-      keep_transmitting = True
+      with open(filename, "ab") as binary_file: # see appending issue
+        binary_file.write(chunk)
+        # send_ack = True
+        if (node.length_received == node.pkt_length):
+          # print('reached len', os.path.getsize(filename))
+          fin = True
+          binary_file.close()
+          # print(os.path.getsize(filename))
+      node.state_machine.next("REC PKT")
+      # print('state should be wait req', node.state_machine.state, node.name)
+        # could do wb and seek
+    # could print which bits are different
+        
+    elif ("SYN " in rec_msg.decode()):
+      pickle_msg = rec_msg.decode()
+      filename, sender_host, sender_port = parse_syn(pickle_msg)
+      # saving info for owner
+      node.requestor = (sender_host, sender_port)
+      node.owner = (node.host, node.port)
+      node.filename = filename
+      # print('syn pkt received by', node.name)
+      node.state_machine.next("SYN")
     
-    elif (rec_msg == "FIN"):
+    elif ("SYN+ACK" in rec_msg.decode()):
+      rec_msg = rec_msg.decode() 
+      node.pkt_length = int(rec_msg.split(" ")[-1])
+      # print("syn ack msg received by", node.name)
+      # print("pkt length to be received is", node.pkt_length)
+      node.state_machine.next("SYN+ACK")
+    
+    elif (rec_msg.decode() == "ACK 0"):
+      # print('ack 0 received by', node.name)
+      node.state_machine.next("rec ACK 0")
+      # print(node.name, 'state is', node.state_machine.state)
+        
+    elif (rec_msg.decode() != "ACK 0" and "ACK " in rec_msg.decode()):
+      # send_ack = False
+      node.state_machine.next("REC PKT ACK")
+      # print('state should be send', node.state_machine.state, node.name)
+    
+    elif (rec_msg.decode() == "FIN"):
+      # if (node.length_received == node.pkt_length):
       # could put some check on byte length
-      requestor_machine.reset()
-      owner_machine.reset()
+      # print("FIN rec")
+      node.state_machine.reset()
+      # print(node.state_machine.state, node.name)
+      
+      # at start -> send how many bytes should be transferred
+      # once number of bytes received FIN
     
 if __name__ == '__main__':
   conf_file = None
@@ -254,3 +330,6 @@ if __name__ == '__main__':
     if (is_file(cmd)):
       filename = cmd
       fetch_file = True
+  
+  # check that packets are received in order and same number are sent and received
+  # contents of each packet is correct
