@@ -13,10 +13,9 @@ BUFSIZE_TO_REC = 1500 # including PUT header
 W_SIZE = 30
 filename = None
 fetch_file = False
-# send_ack = False
-fin = False
 sent_chunk = None
 rec_chunk = None
+ack_lock = threading.Lock()
 
 class Network_node():
   def __init__(self, host, port, peers, content, name):
@@ -33,6 +32,12 @@ class Network_node():
     self.pkt_length = 0
     self.length_received = 0
     self.rec_acks = dict()
+    self.num_msgs_sent = 0
+    # self.num_msgs_rec = 0
+    # self.num_acks_sent = 0
+    self.num_acks_rec = 0
+    
+    
     # node.last_file_ptr = 0
     
 class Network_peer():
@@ -168,53 +173,49 @@ def tx_thread(name, socket, node):
     
     elif (node.state_machine.state == Handshake_states.send):
       with open(node.filename, "rb") as file_descriptor:
-        # while True:
-          # req_port = node.requestor[1]
-          # cur_ack = node.peers[str(req_port)].ack
-          # for i in range(cur_ack):
-          #   file_descriptor.seek(BUFSIZE_FROM_FILE)
-          # chunk = file_descriptor.read(BUFSIZE_FROM_FILE)
-          # print(file_descriptor.tell())
-
-          # if (chunk and node.state_machine.state == Handshake_states.send):
-          if (node.length_received < node.pkt_length):
-            # node.length_received += len(chunk)
+        while (node.num_msgs_sent < W_SIZE):
+          
+          req_port = node.requestor[1]
+          cur_ack = node.peers[str(req_port)].ack
+          file_descriptor.seek(BUFSIZE_FROM_FILE*(cur_ack-1)) # whence=1, ref from cur position
+          # print('cur ack', cur_ack)
+          # print('tell', file_descriptor.tell())
+          chunk = file_descriptor.read(BUFSIZE_FROM_FILE)
+          
+          if (chunk):
             put_bytes = "PUT ".encode()
-            req_port = node.requestor[1]
-            cur_ack = node.peers[str(req_port)].ack
-              
-            # for i in range(cur_ack-1):
-              # print('i', i)
-            file_descriptor.seek(BUFSIZE_FROM_FILE*(cur_ack-1),1) # whence=1, ref from cur position
-              # print('tell', file_descriptor.tell())
-            chunk = file_descriptor.read(BUFSIZE_FROM_FILE)
             sent_chunk = chunk
             node.length_received += len(chunk)
+            # print('len rec', node.length_received)
             # print('send', node.name, cur_ack)
             ack_bytes = (str(cur_ack) + " ").encode()
             node.peers[str(req_port)].ack += 1
             msg = put_bytes + ack_bytes + chunk
             socket.sendto(msg, node.requestor)
-            node.state_machine.next("SENT PKT")
-            # print('state should be wait send', node.state_machine.state, node.name)
-          # elif (not chunk and node.state_machine.state == Handshake_states.send):
+            node.num_msgs_sent += 1
+            # node.state_machine.next("SENT PKT")
           else:
-            # print('getting here', node.length_received)
-            
-            # if (node.length_received == node.pkt_length):
             msg = "FIN"
             node.state_machine.reset()
             socket.sendto(msg.encode(), node.requestor)
-          # file_descriptor.seek(BUFSIZE_FROM_FILE
-          file_descriptor.close()      
-    elif (node.state_machine.state == Handshake_states.wait_req):
+            break # not sure if this is necessary
+        node.state_machine.next("SENT PKT")  
+        # print('state should be wait send', node.state_machine.state, node.name)    
+    elif (node.state_machine.state == Handshake_states.req):
       # print('req sending ack', node.name)
+      # assert(node.name == "node1")
       owner_port = node.owner[1]
+      # ack_num = None
+      # with ack_lock:
+      # print('accessing this')
+      if (owner_port not in node.rec_acks):
+        time.sleep(.01)
       ack_num = node.rec_acks[owner_port]
+      # print(node.rec_acks)
       msg = "ACK " + str(ack_num)
-      # msg = msg.to_bytes(byteorder="big")
+      # print('req sending ack', msg, node.name)
       socket.sendto(msg.encode(), node.owner)
-      node.state_machine.next("SENT PKT ACK")
+      # node.state_machine.next("SENT PKT ACK")
       # print('state should be req', node.state_machine.state, node.name, msg)
       # node.peers[str(owner_port)].ack += 1
       # send_ack = False
@@ -224,48 +225,37 @@ def rx_thread(name, socket, node):
     rec_msg, addr = socket.recvfrom(BUFSIZE_TO_REC)
 
     global filename
-    global fin
     
     put_bytes = "PUT ".encode()
     # print(rec_msg.decode())
     
     if (put_bytes == rec_msg[0:4] and node.state_machine.state == Handshake_states.req):
-      # print("HELLO")
       seq_num, chunk = parse_rec_msg(rec_msg[4:])
       # print('rec', node.name, 'sn', seq_num)
-      # assert(1==0)
-      prev_len = node.length_received
       node.length_received += len(chunk)
       # if not (node.length_received == node.pkt_length):
         # assert(node.length_received == BUFSIZE_FROM_FILE*seq_num)
-      # rec_packets += 1
-      # print("rec_packets", rec_packets)
-      # print("REC LEN", len(chunk))
-      # if (node.length_received <= prev_len):
-        # print(node.length_received)
-        # print('len didnt change')
       owner_port = node.owner[1]
-      prev_num = None
-      if (owner_port in node.rec_acks):
-        prev_num = node.rec_acks[owner_port]
-      node.rec_acks[owner_port] = seq_num
+      # prev_num = None
+      # if (owner_port in node.rec_acks):
+        # prev_num = node.rec_acks[owner_port]
+      with ack_lock:
+        # print('setting this')
+        node.rec_acks[owner_port] = seq_num
+      # print(node.rec_acks)
       # if (prev_num != None):
-        # print('sn', seq_num)
-        # print('pn', prev_num)
         # assert(seq_num == prev_num + 1)
         
       with open(filename, "ab") as binary_file: # see appending issue
         binary_file.write(chunk)
-        # send_ack = True
         if (node.length_received == node.pkt_length):
-          # print('reached len', os.path.getsize(filename))
-          fin = True
+          print('received entire length')
           binary_file.close()
-          # print(os.path.getsize(filename))
-      node.state_machine.next("REC PKT")
+      # node.num_msgs_rec += 1
+      # if (node.num_msgs_rec == W_SIZE):
+      # node.state_machine.next("REC PKT")
       # print('state should be wait req', node.state_machine.state, node.name)
         # could do wb and seek
-    # could print which bits are different
         
     elif ("SYN " in rec_msg.decode()):
       pickle_msg = rec_msg.decode()
@@ -291,8 +281,12 @@ def rx_thread(name, socket, node):
         
     elif (rec_msg.decode() != "ACK 0" and "ACK " in rec_msg.decode()):
       # send_ack = False
-      node.state_machine.next("REC PKT ACK")
-      # print('state should be send', node.state_machine.state, node.name)
+      node.num_acks_rec += 1
+      if (node.num_acks_rec == W_SIZE):
+        node.state_machine.next("REC PKT ACK")
+        node.num_msgs_sent = 0 
+        # print('reset for next window')
+        # print('state should be send', node.state_machine.state, node.name)
     
     elif (rec_msg.decode() == "FIN"):
       # if (node.length_received == node.pkt_length):
